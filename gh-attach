@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-readonly VERSION="0.1.0"
+readonly VERSION="0.2.0"
 readonly UPLOAD_HOST="https://uploads.github.com"
 
 usage() {
@@ -73,13 +73,21 @@ urlencode() {
 	printf '%s' "$out"
 }
 
+# escape_markdown backslash-escapes the characters a filename could use to break
+# out of the link syntax and inject its own. This matters because the bundled
+# agent skill uploads files the agent did not necessarily name — a CI artifact
+# or a downloaded attachment can carry a hostile basename.
+escape_markdown() {
+	printf '%s' "$1" | sed 's/[][\\()]/\\&/g'
+}
+
 # render prints the reference GitHub's markdown renderer expects: an inline
 # embed for images, and a bare URL for video, which GitHub turns into a player.
 # A video wrapped in ![]() or []() renders as a dead link instead.
 render() {
 	local name="$1" url="$2" type="$3"
 	case "$type" in
-	image/*) printf '![%s](%s)\n' "$name" "$url" ;;
+	image/*) printf '![%s](%s)\n' "$(escape_markdown "$name")" "$url" ;;
 	video/*) printf '%s\n' "$url" ;;
 	esac
 }
@@ -88,7 +96,7 @@ render() {
 # failure so a bad file in a batch doesn't abort the rest.
 upload() {
 	local file="$1" repo_id="$2" token="$3"
-	local name ext type query response status body url
+	local name ext type query response status body url safe_path
 
 	[[ -f $file ]] || {
 		printf 'gh-attach: not a file: %s\n' "$file" >&2
@@ -105,15 +113,29 @@ upload() {
 
 	query="name=$(urlencode "$name")&content_type=$(urlencode "$type")&repository_id=${repo_id}"
 
+	# A relative path is prefixed with ./ so curl cannot read a leading dash as
+	# an option, and a file literally named "-" cannot turn -T into "read stdin".
+	case "$file" in
+	/*) safe_path="$file" ;;
+	*) safe_path="./$file" ;;
+	esac
+
 	# -T streams the file rather than buffering it in memory, and lets curl
 	# negotiate Expect: 100-continue so a rejected upload never sends its body.
 	# -X POST overrides the PUT that -T would otherwise use.
-	response="$(curl -sS -X POST -T "$file" \
-		-H "Authorization: Bearer ${token}" \
-		-H "Accept: application/json" \
-		-H "Content-Type: ${type}" \
-		-w '\n%{http_code}' \
-		"${UPLOAD_HOST}/user-attachments/assets?${query}")" || {
+	#
+	# The Authorization header is fed through a curl config file on stdin (-K -)
+	# rather than -H, which would put the token in argv: /proc/<pid>/cmdline is
+	# world-readable on Linux, and same-user processes can read it anywhere.
+	# -T reads from a path, so stdin is free for this.
+	# --globoff stops curl from treating [ ] { } in the path or URL as glob
+	# ranges; a filename containing brackets otherwise fails with a parse error.
+	response="$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
+		curl -sS --globoff -X POST -T "$safe_path" -K - \
+			-H "Accept: application/json" \
+			-H "Content-Type: ${type}" \
+			-w '\n%{http_code}' \
+			--url "${UPLOAD_HOST}/user-attachments/assets?${query}")" || {
 		printf 'gh-attach: upload failed (network): %s\n' "$name" >&2
 		return 1
 	}
@@ -177,18 +199,32 @@ main() {
 
 	command -v gh >/dev/null || die "gh CLI not found - see https://cli.github.com"
 	command -v curl >/dev/null || die "curl not found"
-	gh auth status >/dev/null 2>&1 || die "gh is not authenticated - run: gh auth login"
+	# Every gh call below is pinned to github.com. Without --hostname, gh honors
+	# GH_HOST, so on a machine configured for GitHub Enterprise this script would
+	# read an Enterprise token and POST it to the hardcoded uploads.github.com —
+	# handing one host's credential to another. Pinning makes it fail closed.
+	gh auth status --hostname github.com >/dev/null 2>&1 ||
+		die "gh is not authenticated to github.com - run: gh auth login --hostname github.com"
 
 	if [[ -z $repo ]]; then
+		# This one reads the workspace remote, so on an Enterprise checkout it
+		# yields an Enterprise repo. The pinned api call below then 404s rather
+		# than silently targeting the wrong host.
 		repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)" ||
 			die "not in a GitHub repository - pass --repo OWNER/REPO"
 	fi
 
 	# The upload endpoint keys on the numeric repository id, not owner/name.
-	repo_id="$(gh api "repos/${repo}" --jq .id 2>/dev/null)" ||
-		die "cannot resolve repository: ${repo}"
+	repo_id="$(gh api --hostname github.com "repos/${repo}" --jq .id 2>/dev/null)" ||
+		die "cannot resolve repository on github.com: ${repo}"
 
-	token="$(gh auth token)" || die "cannot read gh token"
+	token="$(gh auth token --hostname github.com)" || die "cannot read gh token"
+
+	# The token is interpolated into a curl config file, where a quote or
+	# backslash would corrupt the header. Real gh tokens are alphanumeric with
+	# underscores; anything else means something unexpected, so refuse it.
+	[[ $token =~ ^[A-Za-z0-9_]+$ ]] ||
+		die "gh token has an unexpected format - refusing to use it"
 
 	for file in "${files[@]}"; do
 		upload "$file" "$repo_id" "$token" || failed=1
