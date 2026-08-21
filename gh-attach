@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+#
+# gh-attach - upload images and video to GitHub's user-attachments CDN
+#             and print a ready-to-paste markdown reference.
+#
+# Authenticates with your existing `gh` CLI OAuth token. It never reads browser
+# cookies, never touches your Keychain, and talks to no host other than
+# api.github.com (via `gh`) and uploads.github.com.
+#
+# Requires: gh (authenticated), curl, git
+# Usage:    gh-attach FILE... [--repo OWNER/REPO]
+
+set -euo pipefail
+
+readonly UPLOAD_HOST="https://uploads.github.com"
+
+usage() {
+	cat <<'EOF'
+Usage: gh-attach FILE... [--repo OWNER/REPO]
+
+Uploads images and video to GitHub and prints a markdown reference for each,
+suitable for pasting into a PR description, issue, or comment.
+
+Options:
+  --repo OWNER/REPO   Target repository. Defaults to the current git workspace.
+  -h, --help          Show this help.
+
+Supported: png jpg jpeg gif webp svg mp4 mov webm
+
+Notes:
+  * You must have push access to the target repository.
+  * Uploaded assets resolve only for you until referenced in rendered content;
+    after that, visibility follows whatever references them.
+EOF
+}
+
+die() {
+	printf 'gh-attach: %s\n' "$1" >&2
+	exit 1
+}
+
+# content_type maps a file extension to the media type GitHub expects. The
+# endpoint accepts images and video only, so an unmapped extension is an error
+# rather than an application/octet-stream guess the server would reject anyway.
+# macOS ships bash 3.2, which has no ${var,,} lowercase expansion.
+content_type() {
+	case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+	png) printf 'image/png' ;;
+	jpg | jpeg) printf 'image/jpeg' ;;
+	gif) printf 'image/gif' ;;
+	webp) printf 'image/webp' ;;
+	svg) printf 'image/svg+xml' ;;
+	mp4) printf 'video/mp4' ;;
+	mov) printf 'video/quicktime' ;;
+	webm) printf 'video/webm' ;;
+	*) return 1 ;;
+	esac
+}
+
+# urlencode percent-escapes a string for use in a query parameter. LC_ALL=C
+# makes the loop iterate bytes, so multi-byte UTF-8 filenames encode correctly.
+urlencode() {
+	local LC_ALL=C string="$1" out='' char
+	for ((i = 0; i < ${#string}; i++)); do
+		char="${string:i:1}"
+		case "$char" in
+		[a-zA-Z0-9.~_-]) out+="$char" ;;
+		*) out+="$(printf '%%%02X' "'$char")" ;;
+		esac
+	done
+	printf '%s' "$out"
+}
+
+# render prints the reference GitHub's markdown renderer expects: an inline
+# embed for images, and a bare URL for video, which GitHub turns into a player.
+# A video wrapped in ![]() or []() renders as a dead link instead.
+render() {
+	local name="$1" url="$2" type="$3"
+	case "$type" in
+	image/*) printf '![%s](%s)\n' "$name" "$url" ;;
+	video/*) printf '%s\n' "$url" ;;
+	esac
+}
+
+# upload sends one file and prints its markdown reference. Returns non-zero on
+# failure so a bad file in a batch doesn't abort the rest.
+upload() {
+	local file="$1" repo_id="$2" token="$3"
+	local name ext type query response status body url
+
+	[[ -f $file ]] || {
+		printf 'gh-attach: not a file: %s\n' "$file" >&2
+		return 1
+	}
+
+	name="$(basename -- "$file")"
+	ext="${name##*.}"
+	if ! type="$(content_type "$ext")"; then
+		printf 'gh-attach: unsupported type .%s (%s) - this endpoint takes images and video only\n' \
+			"$ext" "$name" >&2
+		return 1
+	fi
+
+	query="name=$(urlencode "$name")&content_type=$(urlencode "$type")&repository_id=${repo_id}"
+
+	# -T streams the file rather than buffering it in memory, and lets curl
+	# negotiate Expect: 100-continue so a rejected upload never sends its body.
+	# -X POST overrides the PUT that -T would otherwise use.
+	response="$(curl -sS -X POST -T "$file" \
+		-H "Authorization: Bearer ${token}" \
+		-H "Accept: application/json" \
+		-H "Content-Type: ${type}" \
+		-w '\n%{http_code}' \
+		"${UPLOAD_HOST}/user-attachments/assets?${query}")" || {
+		printf 'gh-attach: upload failed (network): %s\n' "$name" >&2
+		return 1
+	}
+
+	status="${response##*$'\n'}"
+	body="${response%$'\n'*}"
+
+	if [[ $status != 201 ]]; then
+		printf 'gh-attach: upload failed (HTTP %s): %s\n%s\n' "$status" "$name" "${body:0:300}" >&2
+		return 1
+	fi
+
+	url="$(printf '%s' "$body" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+	[[ -n $url ]] || {
+		printf 'gh-attach: no url in response for %s: %s\n' "$name" "${body:0:300}" >&2
+		return 1
+	}
+
+	render "$name" "$url" "$type"
+}
+
+main() {
+	local repo='' files=() token repo_id failed=0
+
+	while (($# > 0)); do
+		case "$1" in
+		-h | --help)
+			usage
+			exit 0
+			;;
+		--repo)
+			[[ ${2-} ]] || die "--repo needs OWNER/REPO"
+			repo="$2"
+			shift 2
+			;;
+		--repo=*)
+			repo="${1#--repo=}"
+			shift
+			;;
+		--)
+			shift
+			files+=("$@")
+			break
+			;;
+		-*) die "unknown option: $1" ;;
+		*)
+			files+=("$1")
+			shift
+			;;
+		esac
+	done
+
+	((${#files[@]})) || {
+		usage >&2
+		exit 2
+	}
+
+	command -v gh >/dev/null || die "gh CLI not found - see https://cli.github.com"
+	command -v curl >/dev/null || die "curl not found"
+	gh auth status >/dev/null 2>&1 || die "gh is not authenticated - run: gh auth login"
+
+	if [[ -z $repo ]]; then
+		repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)" ||
+			die "not in a GitHub repository - pass --repo OWNER/REPO"
+	fi
+
+	# The upload endpoint keys on the numeric repository id, not owner/name.
+	repo_id="$(gh api "repos/${repo}" --jq .id 2>/dev/null)" ||
+		die "cannot resolve repository: ${repo}"
+
+	token="$(gh auth token)" || die "cannot read gh token"
+
+	for file in "${files[@]}"; do
+		upload "$file" "$repo_id" "$token" || failed=1
+	done
+
+	exit "$failed"
+}
+
+main "$@"
