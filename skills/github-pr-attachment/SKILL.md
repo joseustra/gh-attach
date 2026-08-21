@@ -33,8 +33,8 @@ Check these first. Report failures to the user — do not install or authenticat
 on their behalf.
 
 1. `gh auth status` — if it fails, tell the user to run `gh auth login`.
-2. `gh-attach --help` — if the command is not found, tell the user to install it
-   (see the project README). Never install it yourself.
+2. `gh-attach --version` — if the command is not found, tell the user to install
+   it (see the project README). Never install it yourself.
 
 ## Constraints you must respect
 
