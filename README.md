@@ -88,6 +88,20 @@ Anything else is rejected locally with a clear message rather than sent to be
 refused. The endpoint accepts images and video only when authenticating with an
 OAuth token.
 
+## Credential handling
+
+- The `gh` OAuth token is passed to curl through a **config file on stdin**
+  (`-K -`), never as `-H` on the command line. Process arguments are readable
+  via `/proc/<pid>/cmdline` on Linux and by same-user processes elsewhere.
+- Every `gh` invocation is **pinned to `github.com`** with `--hostname`. Without
+  it, `gh` honors `GH_HOST`, so a machine configured for GitHub Enterprise would
+  read an Enterprise token and send it to the hardcoded `uploads.github.com`.
+  Pinning makes that fail closed instead.
+- Filenames are **escaped before interpolation** into markdown, so a file named
+  `evil](#) ![pwn.png` cannot inject its own link. This matters because the
+  agent skill uploads files the agent did not name.
+- The token is never printed, logged, or written to disk.
+
 ## Requirements and limits
 
 - **Push access to the target repository.** Without it the endpoint answers 404.
